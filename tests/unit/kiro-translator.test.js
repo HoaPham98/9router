@@ -306,15 +306,32 @@ describe("convertOpenAIToKiro (openai → kiro EventStream)", () => {
     expect(payload.modelId).toBe("gpt-5");
   });
 
-  it("passes <thinking> tags through as text content (no extraction)", () => {
+  it("extracts <thinking> tags into reasoningContentEvent, rest as text", () => {
     const chunk = makeOpenAIChunk({
       choice: { delta: { content: "<thinking>Let me think...</thinking>Here is the answer" } }
     });
     const state = initKiroState();
-    const { eventType, payload } = decodeFirst(convertOpenAIToKiro(chunk, state));
-    // Text content is passed through as-is — reasoningContentEvent is only for delta.reasoning_content
-    expect(eventType).toBe("assistantResponseEvent");
-    expect(payload.content).toBe("<thinking>Let me think...</thinking>Here is the answer");
+    const decoded = decodeAll(convertOpenAIToKiro(chunk, state));
+    // Thinking extracted to reasoningContentEvent
+    const reasoning = decoded.find(d => d.eventType === "reasoningContentEvent");
+    expect(reasoning).toBeDefined();
+    expect(reasoning.payload.content).toBe("Let me think...");
+    // Remaining text as assistantResponseEvent
+    const text = decoded.find(d => d.eventType === "assistantResponseEvent");
+    expect(text).toBeDefined();
+    expect(text.payload.content).toBe("Here is the answer");
+  });
+
+  it("handles <think> tag variant", () => {
+    const chunk = makeOpenAIChunk({
+      choice: { delta: { content: "<think>reasoning</think>response" } }
+    });
+    const state = initKiroState();
+    const decoded = decodeAll(convertOpenAIToKiro(chunk, state));
+    const reasoning = decoded.find(d => d.eventType === "reasoningContentEvent");
+    expect(reasoning.payload.content).toBe("reasoning");
+    const text = decoded.find(d => d.eventType === "assistantResponseEvent");
+    expect(text.payload.content).toBe("response");
   });
 
   it("emits reasoningContentEvent for delta.reasoning_content", () => {
@@ -653,7 +670,7 @@ describe("response round-trip: kiro → openai → kiro (EventStream)", () => {
     expect(payload.modelId).toBeDefined();
   });
 
-  it("round-trips reasoningContentEvent", () => {
+  it("round-trips reasoningContentEvent — extracts <thinking> back to reasoning", () => {
     const kiroEvent = makeKiroSSE("reasoningContentEvent", {
       reasoningContentEvent: { content: "Let me think about this" }
     });
@@ -662,13 +679,11 @@ describe("response round-trip: kiro → openai → kiro (EventStream)", () => {
     // kiro→openai wraps reasoning in <thinking> tags
     expect(openaiChunk.choices[0].delta.content).toBe("<thinking>Let me think about this</thinking>");
 
-    // openai→kiro for text with <thinking> passes through as assistantResponseEvent
-    // (only delta.reasoning_content triggers reasoningContentEvent)
+    // openai→kiro extracts <thinking> back to reasoningContentEvent
     const state2 = initKiroState();
     const { eventType, payload } = decodeFirst(convertOpenAIToKiro(openaiChunk, state2));
-    expect(eventType).toBe("assistantResponseEvent");
-    expect(payload.content).toContain("<thinking>");
-    expect(payload.content).toContain("Let me think about this");
+    expect(eventType).toBe("reasoningContentEvent");
+    expect(payload.content).toBe("Let me think about this");
   });
 
   it("round-trips messageStopEvent", () => {

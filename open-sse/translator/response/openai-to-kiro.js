@@ -34,7 +34,64 @@ export function initKiroState() {
     toolCallInit: {},    // { [index]: { id, name } } — first frame emitted, tracks seen tools
     hasToolCalls: false, // Whether this response uses tool calls (affects termination)
     finishSent: false,   // Whether termination has been emitted
-    usage: null          // Accumulated usage from usage-only chunks
+    usage: null,         // Accumulated usage from usage-only chunks
+    inThink: false,      // Whether inside a <thinking>/<think> block across chunks
+    thinkBuf: ""         // Buffer for partial thinking content
+  };
+}
+
+/**
+ * Extract thinking blocks from text content.
+ * Handles both <thinking>...</thinking> and <think>...</think> tags,
+ * including partial tags split across SSE chunks.
+ */
+function extractThinking(text, state) {
+  if (!text) return { thinking: null, text: null };
+
+  let working = text;
+
+  // Prepend buffered partial thinking from previous chunk
+  if (state.inThink && state.thinkBuf) {
+    working = state.thinkBuf + working;
+    state.thinkBuf = "";
+    state.inThink = false;
+  }
+
+  // Match <thinking> or <think> opening tags
+  const startRe = /<thinking>|<think>/i;
+  const startMatch = working.match(startRe);
+
+  if (!startMatch) {
+    return { thinking: null, text: working };
+  }
+
+  const tag = startMatch[0].toLowerCase();
+  const closeTag = tag === "<think>" ? "</think>" : "</thinking>";
+  const startIdx = startMatch.index;
+  const endIdx = working.indexOf(closeTag, startIdx + tag.length);
+
+  if (endIdx === -1) {
+    // Opening tag without closing — buffer for next chunk
+    state.inThink = true;
+    state.thinkBuf = working.slice(startIdx);
+    const before = working.slice(0, startIdx).trim();
+    return { thinking: null, text: before || null };
+  }
+
+  // Complete block found
+  const thinking = working.slice(startIdx + tag.length, endIdx);
+  const before = working.slice(0, startIdx).trim();
+  const after = working.slice(endIdx + closeTag.length).trim();
+  const rest = [before, after].filter(Boolean).join("");
+
+  // Recursively process for more blocks
+  const recurse = rest
+    ? extractThinking(rest, { inThink: false, thinkBuf: "" })
+    : { thinking: null, text: null };
+
+  return {
+    thinking: thinking || null,
+    text: recurse.text || null
   };
 }
 
@@ -84,6 +141,16 @@ export function convertOpenAIToKiro(chunk, state) {
   // Flush: ensure clean stream termination
   if (!chunk) {
     if (state.finishSent) return null;
+    // Flush any remaining buffered thinking
+    if (state.inThink && state.thinkBuf) {
+      state.inThink = false;
+      const thinking = state.thinkBuf;
+      state.thinkBuf = "";
+      return encodeEventStream("reasoningContentEvent", {
+        content: thinking,
+        modelId: state.modelId || ""
+      });
+    }
     return encodeEventStream("messageStopEvent", {});
   }
 
@@ -140,12 +207,23 @@ export function convertOpenAIToKiro(chunk, state) {
     }));
   }
 
-  // Handle text content — emitted as assistantResponseEvent
+  // Handle text content — extract thinking blocks, emit rest as assistantResponseEvent
   if (delta.content) {
-    frames.push(encodeEventStream("assistantResponseEvent", {
-      content: delta.content,
-      modelId
-    }));
+    const { thinking, text } = extractThinking(delta.content, state);
+
+    if (thinking) {
+      frames.push(encodeEventStream("reasoningContentEvent", {
+        content: thinking,
+        modelId
+      }));
+    }
+
+    if (text) {
+      frames.push(encodeEventStream("assistantResponseEvent", {
+        content: text,
+        modelId
+      }));
+    }
   }
 
   // Handle finish_reason
